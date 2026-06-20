@@ -1,4 +1,5 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from langchain_community.document_loaders import PDFPlumberLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -22,11 +23,13 @@ from mistralai.client import Mistral
 client = Mistral(api_key=API_KEY)
 
 FAISS_INDEX_PATH = "faiss_index_juridique"
+PDF_DIR_NAME = "pdfs_juridiques"
+
 
 def load_vectorstore():
     data_dir = Path(__file__).parent
     faiss_path = data_dir / FAISS_INDEX_PATH
-    pdf_dir = data_dir / "pdfs_juridiques"
+    pdf_dir = data_dir / PDF_DIR_NAME
 
     embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
 
@@ -67,17 +70,11 @@ vectorstore = load_vectorstore()
 
 # ── Extraction de citations depuis les métadonnées et le contenu des chunks ──
 
-# Patterns d'articles de loi courants dans les textes OHADA / sénégalais
 _LAW_PATTERNS = [
-    # "article 45", "art. 45", "art L-51", "article L. 45"
     r"(?:article|art\.?)\s+(?:L[\.\-]?)?\d+(?:[\-\.]\d+)*(?:\s+(?:du|de\s+la|de\s+l[\''])\s+[\w\s]+?(?=,|\.|;|$))?",
-    # "loi n° 97-17", "loi n°97-17"
     r"loi\s+n[°o]?\s*\d{2,4}[\-/]\d{2,4}",
-    # "décret n° 94-600"
     r"décret\s+n[°o]?\s*\d{2,4}[\-/]\d{2,4}",
-    # "acte uniforme ..."
     r"acte\s+uniforme\s+[\w\s]+?(?=,|\.|;|\n|$)",
-    # "AUDCG", "AUPCAP", "AUSCGIE" — sigles OHADA
     r"\b(?:AUD(?:CG|CGI|CAP|SCGIE|TVS|PE)|OHADA|UEMOA|BCEAO|CIMA|Code\s+du\s+travail)\b",
 ]
 
@@ -85,12 +82,10 @@ _COMPILED = [re.compile(p, re.IGNORECASE) for p in _LAW_PATTERNS]
 
 
 def _source_label(metadata: dict) -> str:
-    """Construit un label court depuis les métadonnées du chunk."""
     source = metadata.get("source", "")
     page = metadata.get("page")
     if source:
         name = Path(source).stem
-        # Rendre le nom plus lisible : tirets/underscores → espaces, casse titre
         name = re.sub(r"[_\-]+", " ", name).title()
         if page is not None:
             return f"{name} · p. {int(page) + 1}"
@@ -99,30 +94,21 @@ def _source_label(metadata: dict) -> str:
 
 
 def extract_citations(docs_with_scores: list) -> list[str]:
-    """
-    Extrait des références juridiques citables à partir des chunks RAG.
-    Retourne une liste dédupliquée de chaînes courtes, max 5 items.
-    """
     seen: set[str] = set()
     results: list[str] = []
 
     for doc, _score in docs_with_scores:
-        # 1. Label du fichier source
         label = _source_label(doc.metadata)
         if label and label not in seen:
             seen.add(label)
             results.append(label)
 
-        # 2. Articles / lois mentionnés dans le texte du chunk
         for pattern in _COMPILED:
             for m in pattern.finditer(doc.page_content):
                 raw = m.group(0).strip()
-                # Normaliser : couper à 60 chars, supprimer sauts de ligne
                 clean = re.sub(r"\s+", " ", raw)[:60].rstrip(" ,;.")
-                # Ne garder que les références non triviales (> 4 chars)
                 if len(clean) > 4 and clean.lower() not in seen:
                     seen.add(clean.lower())
-                    # Capitaliser proprement
                     results.append(clean[0].upper() + clean[1:])
 
         if len(results) >= 5:
@@ -132,25 +118,17 @@ def extract_citations(docs_with_scores: list) -> list[str]:
 
 
 def compute_confidence(docs_with_scores: list) -> int:
-    """
-    Convertit les scores de distance FAISS en pourcentage de fiabilité.
-    FAISS retourne des distances L2 : plus petit = plus proche = plus fiable.
-    On mappe [0, 2] → [100, 40] avec un plancher à 40.
-    """
     if not docs_with_scores:
         return 50
 
-    # Prendre les 3 meilleurs scores (distance L2)
     distances = [score for _, score in docs_with_scores[:3]]
     avg_dist = sum(distances) / len(distances)
 
-    # Mapping linéaire : dist=0 → 100%, dist=2 → 40%
     confidence = max(40, min(100, int(100 - avg_dist * 30)))
     return confidence
 
 
 def ask_rag(question: str) -> dict:
-    # Recherche avec scores de similarité
     docs_with_scores = vectorstore.similarity_search_with_score(question, k=3)
 
     context = "\n".join([doc.page_content for doc, _ in docs_with_scores])
@@ -158,7 +136,6 @@ def ask_rag(question: str) -> dict:
     citations = extract_citations(docs_with_scores)
     confidence = compute_confidence(docs_with_scores)
 
-    # Citation hint injecté dans le prompt pour guider Mistral
     citation_hint = ""
     if citations:
         citation_hint = (
@@ -202,6 +179,46 @@ Réponds en français naturel et fluide :"""
     }
 
 
+# ── Hub de documents : listing + recherche + téléchargement ──────────────────
+
+# Catégorisation simple par mots-clés présents dans le nom de fichier.
+_CATEGORY_RULES = [
+    (("travail", "emploi", "salari", "licenciement"), "Droit du travail"),
+    (("ohada", "audcg", "auscgie", "aupcap", "acte uniforme"), "OHADA"),
+    (("fiscal", "impot", "impôt", "tva", "uemoa"), "Fiscalité"),
+    (("contrat", "bail", "vente", "commercial"), "Contrats"),
+    (("societe", "société", "sarl", "sa ", "rccm"), "Droit des sociétés"),
+]
+
+
+def _categorize(filename: str) -> str:
+    lower = filename.lower()
+    for keywords, category in _CATEGORY_RULES:
+        if any(kw in lower for kw in keywords):
+            return category
+    return "Général"
+
+
+def _list_documents() -> list[dict]:
+    pdf_dir = Path(__file__).parent / PDF_DIR_NAME
+    if not pdf_dir.exists():
+        return []
+
+    docs = []
+    for pdf_path in sorted(pdf_dir.glob("*.pdf")):
+        stat = pdf_path.stat()
+        display_name = re.sub(r"[_\-]+", " ", pdf_path.stem).strip().title()
+        docs.append(
+            {
+                "filename": pdf_path.name,
+                "display_name": display_name,
+                "category": _categorize(pdf_path.name),
+                "size_kb": round(stat.st_size / 1024, 1),
+            }
+        )
+    return docs
+
+
 # ── FastAPI App ───────────────────────────────────────────────────────────────
 
 app = FastAPI(title="MyPME · Assistant Juridique API")
@@ -232,6 +249,57 @@ class Question(BaseModel):
 @app.post("/chat")
 def chat(q: Question):
     return ask_rag(q.message)
+
+
+@app.get("/documents")
+def list_documents(q: str = ""):
+    """
+    Liste les documents de la base de connaissances.
+    Si `q` est fourni, filtre par mot-clé sur le nom de fichier et la catégorie
+    (insensible à la casse, sans accents stricts).
+    """
+    docs = _list_documents()
+
+    if q:
+        needle = q.strip().lower()
+        docs = [
+            d
+            for d in docs
+            if needle in d["display_name"].lower()
+            or needle in d["category"].lower()
+            or needle in d["filename"].lower()
+        ]
+
+    return {"count": len(docs), "documents": docs}
+
+
+@app.get("/documents/download/{filename}")
+def download_document(filename: str):
+    """Télécharge un PDF de la base de connaissances par son nom de fichier exact."""
+    # Sécurité : empêcher toute traversée de répertoire (../, chemins absolus, etc.)
+    safe_name = Path(filename).name
+    if safe_name != filename:
+        raise HTTPException(status_code=400, detail="Nom de fichier invalide.")
+
+    pdf_dir = Path(__file__).parent / PDF_DIR_NAME
+    file_path = pdf_dir / safe_name
+
+    try:
+        file_path = file_path.resolve()
+        pdf_dir_resolved = pdf_dir.resolve()
+        if pdf_dir_resolved not in file_path.parents and file_path != pdf_dir_resolved:
+            raise HTTPException(status_code=400, detail="Chemin invalide.")
+    except (OSError, RuntimeError):
+        raise HTTPException(status_code=400, detail="Chemin invalide.")
+
+    if not file_path.exists() or file_path.suffix.lower() != ".pdf":
+        raise HTTPException(status_code=404, detail="Document introuvable.")
+
+    return FileResponse(
+        path=str(file_path),
+        media_type="application/pdf",
+        filename=safe_name,
+    )
 
 
 if __name__ == "__main__":
